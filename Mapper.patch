@@ -1,0 +1,32 @@
++++ elastalert/elastalert.py	2019-03-14 15:03:06.953297170 +0100
+@@ -10,6 +10,7 @@
+ import time
+ import timeit
+ import traceback
++import ast
+ from email.mime.text import MIMEText
+ from smtplib import SMTP
+ from smtplib import SMTPException
+@@ -1392,6 +1393,22 @@
+         if match_time is not None:
+             body['match_time'] = match_time
+ 
++	try:
++            rule_value = rule['last_var_map']
++	    #print(rule_value)
++	    if rule_value is not None:
++		rule_dict = ast.literal_eval(rule_value)
++		for k,v in rule_dict.items():
++		    #elastalert_logger.info("%s: %s" % (k, v))
++		    match_v = lookup_es_key(match, v)
++		    if match_v is not None:
++			body[k] = match_v
++	except (KeyError, TypeError, SyntaxError):
++	    # rule field is not present in rule file
++	    # rule field is not a string type
++	    # string representation is not dict
++	    pass
++
+         # TODO record info about multiple alerts
+ 
+         # If the alert failed to send, record the exception

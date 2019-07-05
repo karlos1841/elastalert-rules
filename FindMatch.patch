@@ -1,0 +1,234 @@
++++ elastalert/config.py	2019-05-14 09:00:38.003113850 +0200
+@@ -54,6 +54,7 @@
+     'spike': ruletypes.SpikeRule,
+     'blacklist': ruletypes.BlacklistRule,
+     'whitelist': ruletypes.WhitelistRule,
++    'find_match': ruletypes.FindMatch,
+     'change': ruletypes.ChangeRule,
+     'flatline': ruletypes.FlatlineRule,
+     'new_term': ruletypes.NewTermsRule,
++++ elastalert/ruletypes.py	2019-05-14 09:08:56.781844689 +0200
+@@ -2,6 +2,8 @@
+ import copy
+ import datetime
+ import sys
++from elasticsearch.client import Elasticsearch
++from staticconf.loader import yaml_loader
+ 
+ from blist import sortedlist
+ from util import add_raw_postfix
+@@ -209,6 +211,194 @@
+         super(ChangeRule, self).add_match(dict(match.items() + extra.items()))
+ 
+ 
++class FindMatch(object):
++    required_options = frozenset(['compare_key', 'start_value', 'end_value', 'id_field', 'time_min', 'invert'])
++    gconf_filename = '/opt/alert/config.yaml'
++
++    def __init__(self, rules, args=None):
++	self.matches = []
++	self.rules = rules
++	self.compare_key = self.rules['compare_key']
++	self.start_value = self.rules['start_value']
++	self.end_value = self.rules['end_value']
++	self.id_field = self.rules['id_field']
++	self.time_sec = self.rules['time_min'] * 60
++	self.invert = self.rules['invert']
++	# TODO make embrace field optional
++	# fields are taken from last event or start event if last one is not found
++	self.include = self.rules['embrace']
++
++	# dict with id_field as key and timestamp from start event as value
++	self.start_time_per_id = {}
++
++	# dict with id_field as key and include dict as value containing extracted fields from elastic
++	self.start_include_per_id = {}
++
++	# list of end events, needed to remove matching start event if it comes after end event
++	self.end_event_id = []
++
++	self.index_type = self.rules['doc_type']
++
++	self.body = {
++		'rule_name': self.rules['name'],
++		'alert_sent': 'true',
++	}
++
++	try:
++		self.gconf = yaml_loader(self.gconf_filename)
++	except yaml.scanner.ScannerError as e:
++		raise EAException('Could not parse file %s: %s' % (self.gconf_filename, e))
++
++
++    def garbage_collect(self, timestamp):
++	# alert when end event not found after specified time has elapsed
++	if self.invert:
++		timestamp = str(timestamp).rsplit('+', 1)[0]
++		timestamp = timestamp.rsplit('.', 1)[0]
++		utc_time = datetime.datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
++		epoch = (utc_time - datetime.datetime(1970, 1, 1)).total_seconds()
++		for key, value in self.start_time_per_id.items():
++			if epoch - value > self.time_sec:
++				elastalert_logger.info("Alert triggered! End event with id: %s not found" % key)
++				match_dict = {
++				'match_field': self.compare_key,
++				'start_event': self.start_value,
++				'end_event': self.end_value,
++				'id_field': self.id_field,
++				'id_value': key,
++				}
++				match_dict.update(self.start_include_per_id[key])
++				self.body['match_body'] = match_dict
++				self.my_writeback(self.index_type, self.body)
++				del self.start_time_per_id[key]
++				del self.start_include_per_id[key]
++
++
++    def add_match(self, event):
++	pass
++
++    def add_data(self, data):
++	# sort list
++	start_events = []
++	end_events = []
++	for d in data:
++		try:
++			if d[self.compare_key] == self.start_value:
++				start_events.append(d)
++			elif d[self.compare_key] == self.end_value:
++				end_events.append(d)
++		except KeyError:
++			pass
++
++	data = start_events + end_events
++
++	# loop through sorted list
++	for d in data:
++		# keys from include field in rule and values from elastic event
++		include_dict = {}
++		for key in self.include:
++			value = lookup_es_key(d, key)
++			if value is not None:
++				include_dict[key] = value
++
++		try:
++			# convert timestamp from this event to seconds since epoch
++			# get rid of timezone offset and milliseconds
++			timestamp = str(d['@timestamp']).rsplit('+', 1)[0]
++			timestamp = timestamp.rsplit('.', 1)[0]
++			utc_time = datetime.datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
++			epoch = (utc_time - datetime.datetime(1970, 1, 1)).total_seconds()
++
++			# if this event is start event then fill dict with this event's id_field and timestamp
++			# we ignore any further occurrences of start events with the same id_field
++			if d[self.compare_key] == self.start_value:
++				if d[self.id_field] not in self.start_time_per_id:
++					# if end event did not come before start event then add entry for start event
++					if d[self.id_field] not in self.end_event_id:
++						self.start_time_per_id[d[self.id_field]] = epoch
++						self.start_include_per_id[d[self.id_field]] = include_dict
++					# if end event is in the list before start event comes then remove end event entry
++					else:
++						self.end_event_id.remove(d[self.id_field])
++
++			# if this event is end event then check if its id_field is present in dict containing start events
++			elif d[self.compare_key] == self.end_value:
++
++				# we search for matches
++				if not self.invert:
++					# if this event does not have corresponding start event then either we missed one or some error occurred
++					if d[self.id_field] not in self.start_time_per_id:
++						elastalert_logger.info("Found the last event with id: %s without match" % str(d[self.id_field]))
++					else:
++						# if time difference between the events is within specified time then it is an alert
++						diff = epoch - self.start_time_per_id[d[self.id_field]]
++						elastalert_logger.info("Found match, time gap between the events: %s seconds" % str(diff))
++						if diff <= self.time_sec:
++							elastalert_logger.info("Alert triggered for events with id: %s" % str(d[self.id_field]))
++							match_dict = {
++							'match_field': self.compare_key,
++							'start_event': self.start_value,
++							'end_event': self.end_value,
++							'id_field': self.id_field,
++							'id_value': d[self.id_field],
++							'elapsed_time': diff,
++							}
++							match_dict.update(include_dict)
++							self.body['match_body'] = match_dict
++							self.my_writeback(self.index_type, self.body)
++
++						# remove entry from dict
++						del self.start_time_per_id[d[self.id_field]]
++						del self.start_include_per_id[d[self.id_field]]
++
++				# we search for non-matched events so let's delete start entry if end event is found
++				else:
++					if d[self.id_field] in self.start_time_per_id:
++						diff = epoch - self.start_time_per_id[d[self.id_field]]
++						# alert when end event is found but not within specified time
++						if diff > self.time_sec:
++							match_dict = {
++							'match_field': self.compare_key,
++							'start_event': self.start_value,
++							'end_event': self.end_value,
++							'id_field': self.id_field,
++							'id_value': d[self.id_field],
++							}
++							match_dict.update(include_dict)
++							self.body['match_body'] = match_dict
++							self.my_writeback(self.index_type, self.body)
++
++						del self.start_time_per_id[d[self.id_field]]
++						del self.start_include_per_id[d[self.id_field]]
++					# add entry for end event if matching start event not found (maybe end event comes first)
++					else:
++						if d[self.id_field] not in self.end_event_id:
++							self.end_event_id.append(d[self.id_field])
++		except KeyError:
++			pass
++
++	#elastalert_logger.info("Start events gathered so far: %s" % str(self.start_time_per_id))
++
++
++    def my_writeback(self, doc_type, body):
++	url = "http://{}:{}@{}:{}".format(self.gconf['es_username'], self.gconf['es_password'], self.gconf['es_host'], self.gconf['es_port'])
++	es = Elasticsearch([url])
++	writeback_index = self.gconf['writeback_index']
++	writeback_body = body
++
++        for key in writeback_body.keys():
++            # Convert any datetime objects to timestamps
++            if isinstance(writeback_body[key], datetime.datetime):
++                writeback_body[key] = dt_to_ts(writeback_body[key])
++
++        if '@timestamp' not in writeback_body:
++            writeback_body['@timestamp'] = dt_to_ts(ts_now())
++
++	writeback_body['alert_time'] = writeback_body['@timestamp']
++	elastalert_logger.info("body: %s" % str(writeback_body))
++        res = es.index(index=writeback_index, doc_type=doc_type, body=body)
++
++
+ class FrequencyRule(RuleType):
+     """ A rule that matches if num_events number of events occur within a timeframe """
+     required_options = frozenset(['num_events', 'timeframe'])
++++ elastalert/schema.yaml	2019-05-14 09:01:35.119490720 +0200
+@@ -66,6 +66,18 @@
+       ignore_null: {type: boolean}
+       timeframe: *timeframe
+ 
++  - title: Find Match
++    required: [compare_key, start_value, end_value, id_field, time_min, invert]
++    properties:
++      type: {enum: [find_match]}
++      compare_key: {'items': {'type': 'string'},'type': ['string', 'array']}
++      start_value: {type: string}
++      end_value: {type: string}
++      id_field: {'items': {'type': 'string'},'type': ['string', 'array']}
++      time_min: {type: integer}
++      invert: {type: boolean}
++      embrace: {type: array, items: {type: string}}
++
+   - title: Frequency
+     required: [num_events, timeframe]
+     properties:

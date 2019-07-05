@@ -1,0 +1,161 @@
++++ elastalert/config.py	2019-04-04 11:47:17.245822478 +0200
+@@ -55,6 +55,7 @@
+     'blacklist': ruletypes.BlacklistRule,
+     'whitelist': ruletypes.WhitelistRule,
+     'change': ruletypes.ChangeRule,
++    'unique_long_term': ruletypes.UniqueLongTerm,
+     'flatline': ruletypes.FlatlineRule,
+     'new_term': ruletypes.NewTermsRule,
+     'cardinality': ruletypes.CardinalityRule,
++++ elastalert/ruletypes.py	2019-04-04 11:50:57.151207561 +0200
+@@ -2,6 +2,8 @@
+ import copy
+ import datetime
+ import sys
++from elasticsearch.client import Elasticsearch
++from staticconf.loader import yaml_loader
+ 
+ from blist import sortedlist
+ from util import add_raw_postfix
+@@ -209,6 +211,124 @@
+         super(ChangeRule, self).add_match(dict(match.items() + extra.items()))
+ 
+
++class UniqueLongTerm(object):
++    required_options = frozenset(['compare_key', 'no_of_timeperiods', 'timeperiod'])
++    gconf_filename = '/opt/alert/config.yaml'
++
++    # run once at startup
++    def __init__(self, rules, args=None):
++	# only used to prevent from throwing exception
++	self.matches = []
++	self.rules = rules
++	self.values = []
++	self.garbage_time = 0
++	self.exec_num = 0
++	self.field = self.rules['compare_key']
++	self.timeperiods_index = 0
++	self.no_of_timeperiods = self.rules['no_of_timeperiods']
++	for i in range(0, self.no_of_timeperiods):
++		self.values.append(set())
++
++	timeperiod_sec = self.rules['timeperiod'] * 60
++	run_every = str(self.rules['run_every']).split(':')
++	run_every_min = int(run_every[-2])
++	run_every_sec = int(run_every[-1]) + run_every_min * 60
++	del run_every[-1]
++	del run_every[-1]
++	for v in run_every:
++		if int(v) != 0:
++			raise EAException("Run Every option must be set in minutes/seconds")
++	if run_every_sec > timeperiod_sec:
++		raise EAException("Run Every option cannot be greater than Timeperiod option")
++	if timeperiod_sec % run_every_sec != 0:
++		raise EAException("Run Every must fit integer number of times in Timeperiod")
++	self.runs_per_timeperiod = timeperiod_sec / run_every_sec
++
++	self.index_type = self.rules['doc_type']
++	self.body = {
++		'rule_name': self.rules['name'],
++		'alert_sent': 'true',
++	}
++
++	try:
++		self.gconf = yaml_loader(self.gconf_filename)
++	except yaml.scanner.ScannerError as e:
++		raise EAException('Could not parse file %s: %s' % (self.gconf_filename, e))
++
++	elastalert_logger.info("Timeperiod sec: %s, Number of executions per timeperiod: %s, Number of timeperiods: %s" % (str(timeperiod_sec), str(self.runs_per_timeperiod), str(self.no_of_timeperiods)))
++
++
++    # using this method to increment variable for every execution no matter if we get match or not
++    def garbage_collect(self, timestamp):
++	if type(self.garbage_time) is not datetime.datetime:
++		self.garbage_time = timestamp
++	diff = timestamp - self.garbage_time
++	self.garbage_time = timestamp
++	elastalert_logger.info("From garbage collect - time diff since last exec: %s" % str(diff.total_seconds()))
++	if not diff.total_seconds() > 0:
++		return
++
++
++	self.exec_num += 1
++	elastalert_logger.info("Timeperiod: %s/%s" % ( str(self.exec_num), str(self.runs_per_timeperiod) ))
++	# end of timeperiod
++	if self.exec_num >= self.runs_per_timeperiod:
++		self.exec_num = 0
++		self.timeperiods_index += 1
++	# end of all timeperiods (self.no_of_timeperiods)
++	if self.timeperiods_index >= self.no_of_timeperiods:
++		elastalert_logger.info("All timeperiods passed")
++		elastalert_logger.info("Sets for all timeperiods: %s" % str(self.values))
++		self.timeperiods_index = 0
++		result = self.values[0]
++		for i in range(0, self.no_of_timeperiods):
++			result = result & self.values[i]
++			self.values[i].clear()
++
++		if result != set():
++			result_str = ""
++			for r in result:
++				result_str += r + ' '
++			elastalert_logger.info("Alert triggered, final result: %s" % result_str)
++			self.body['match_body'] = {self.field: result_str}
++			self.my_writeback(self.index_type, self.body)
++
++
++
++    # all matches are available after run_every, called before garbage_collect
++    def add_data(self, data):
++	for d in data:
++		try:
++			self.values[self.timeperiods_index].add(d[self.field])
++		except KeyError:
++			pass
++
++    def add_match(self, event):
++	pass
++
++    # needed for use_count_query option set in rule which disables buffer_time
++    #def add_count_data(self, counts):
++	#pass
++
++    def my_writeback(self, doc_type, body):
++	url = "http://{}:{}@{}:{}".format(self.gconf['es_username'], self.gconf['es_password'], self.gconf['es_host'], self.gconf['es_port'])
++	es = Elasticsearch([url])
++	writeback_index = self.gconf['writeback_index']
++	writeback_body = body
++
++        for key in writeback_body.keys():
++            # Convert any datetime objects to timestamps
++            if isinstance(writeback_body[key], datetime.datetime):
++                writeback_body[key] = dt_to_ts(writeback_body[key])
++
++        if '@timestamp' not in writeback_body:
++            writeback_body['@timestamp'] = dt_to_ts(ts_now())
++
++	writeback_body['alert_time'] = writeback_body['@timestamp']
++	elastalert_logger.info("body: %s" % str(writeback_body))
++        res = es.index(index=writeback_index, doc_type=doc_type, body=body)
++
++
+ class FrequencyRule(RuleType):
+     """ A rule that matches if num_events number of events occur within a timeframe """
+     required_options = frozenset(['num_events', 'timeframe'])
++++ elastalert/schema.yaml	2019-04-04 11:47:50.330843082 +0200
+@@ -66,6 +66,15 @@
+       ignore_null: {type: boolean}
+       timeframe: *timeframe
+ 
++
++  - title: Unique Long Term
++    required: [compare_key, no_of_timeperiods, timeperiod]
++    properties:
++      type: {enum: [unique_long_term]}
++      compare_key: {'items': {'type': 'string'},'type': ['string', 'array']}
++      no_of_timeperiods: {type: integer}
++      timeperiod: {type: integer}
++
+   - title: Frequency
+     required: [num_events, timeframe]
+     properties:

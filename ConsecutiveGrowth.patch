@@ -1,0 +1,79 @@
++++ elastalert/config.py	2019-04-23 14:55:45.422987550 +0200
+@@ -60,6 +60,7 @@
+     'cardinality': ruletypes.CardinalityRule,
+     'metric_aggregation': ruletypes.MetricAggregationRule,
+     'percentage_match': ruletypes.PercentageMatchRule,
++    'consecutive_growth': ruletypes.ConsecutiveGrowthRule,
+     'spike_aggregation': ruletypes.SpikeMetricAggregationRule
+ }
+ 
++++ elastalert/ruletypes.py	2019-04-23 15:16:31.036798670 +0200
+@@ -5,6 +5,7 @@
+ 
+ 
+ 
++import array
+ from blist import sortedlist
+ from util import add_raw_postfix
+ from util import dt_to_ts
+@@ -158,6 +159,46 @@
+         return False
+ 
+ 
++class ConsecutiveGrowthRule(CompareRule):
++    required_options = frozenset(['query_key', 'compare_key'])
++    arr = []
++    qkey_arr = []
++
++    def set_off_alarm(self, arr):
++	if arr.buffer_info()[1] < 3:
++		return False
++	if (arr[-1] > arr[-2]) and (arr[-2] > arr[-3]):
++		return True
++	return False
++
++    def add_value(self, arr, value, max_size):
++	try:
++		arr.append(value)
++	except TypeError:
++		elastalert_logger.info("Ignoring value since it is not a number")
++		return False
++	while arr.buffer_info()[1] > max_size:
++		arr.pop(0)
++	if arr.buffer_info()[1] == max_size:
++		return True
++	return False
++
++    def compare(self, event):
++	changed = False
++	qkey = lookup_es_key(event, self.rules['query_key'])
++	value = lookup_es_key(event, self.rules['compare_key'])
++	if qkey not in self.qkey_arr:
++		self.qkey_arr.append(qkey)
++		self.arr.append(array.array('d'))
++
++
++	if self.add_value(self.arr[self.qkey_arr.index(qkey)], value, 3):
++		changed = self.set_off_alarm(self.arr[self.qkey_arr.index(qkey)])
++
++	elastalert_logger.info("%s: %s" % (str(qkey), str(self.arr[self.qkey_arr.index(qkey)].tolist())))
++	return changed
++
++
+ class ChangeRule(CompareRule):
+     """ A rule that will store values for a certain term and match if those values change """
+     required_options = frozenset(['query_key', 'compound_compare_key', 'ignore_null'])
++++ elastalert/schema.yaml	2019-04-23 13:59:38.569843236 +0200
+@@ -66,6 +66,12 @@
+       ignore_null: {type: boolean}
+       timeframe: *timeframe
+ 
++  - title: Consecutive Growth
++    required: [query_key, compare_key]
++    properties:
++      type: {enum: [consecutive_growth]}
++      compare_key: {'items': {'type': 'string'},'type': ['string', 'array']}
++
+   - title: Frequency
+     required: [num_events, timeframe]
+     properties:

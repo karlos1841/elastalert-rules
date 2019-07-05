@@ -1,0 +1,190 @@
++++ elastalert/config.py	2019-06-19 12:46:46.226047063 +0200
+@@ -54,3 +54,4 @@
+     'blacklist': ruletypes.BlacklistRule,
+     'whitelist': ruletypes.WhitelistRule,
++    'difference': ruletypes.Difference,
+     'change': ruletypes.ChangeRule,
++++ elastalert/ruletypes.py	2019-06-19 12:46:34.270091348 +0200
+@@ -1,4 +1,5 @@
+ # -*- coding: utf-8 -*-
++from __future__ import division
+ import copy
+ import datetime
+ import sys
+@@ -208,6 +209,158 @@
+             elastalert_logger.debug("Description of the changed records  " + str(dict(match.items() + extra.items())))
+         super(ChangeRule, self).add_match(dict(match.items() + extra.items()))
+ 
++class Difference(RuleType):
++    required_options = frozenset(['compare_key', 'query_key', 'threshold_pct', 'delta_min', 'agg_min'])
++
++    def __init__(self, rules, args=None):
++	self.matches = []
++	self.rules = rules
++	self.diff_key = self.rules['compare_key']
++	self.threshold_pct = self.rules['threshold_pct']
++	self.delta_sec = self.rules['delta_min'] * 60
++	self.agg_sec = self.rules['agg_min'] * 60
++	self.qkey = self.rules['query_key']
++	# keys are query_key values and values are objects of inner class
++	self.qobj = {}
++	self.include = self.rules['include']
++	# we only need given fields
++	self.include = self.include[:self.include.index('@timestamp')]
++
++	# set realert to 0 to get alert for each query_key in one minute
++	# since this query_key is not part of core elastalert
++	self.rules['realert'] = datetime.timedelta(minutes=0)
++	if not self.delta_sec >= self.agg_sec:
++		raise EAException("delta_min must be greater or equal to agg_min")
++
++
++    def get_epoch(self, ts):
++	# convert timestamp from this event to seconds since epoch
++	# get rid of timezone offset and milliseconds
++	timestamp = str(ts).rsplit('+', 1)[0]
++	timestamp = timestamp.rsplit('.', 1)[0]
++	utc_time = datetime.datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
++	epoch = (utc_time - datetime.datetime(1970, 1, 1)).total_seconds()
++
++	return epoch
++
++    def garbage_collect(self, timestamp):
++	epoch = self.get_epoch(timestamp)
++	for k, v in self.qobj.items():
++		elastalert_logger.info("Documents collected for %s so far: %s" % (k, str(v.diff_key_time)))
++
++
++		diff_key_in_agg = []
++		diff_key_in_agg_history = []
++
++		agg_list = []
++		for i in self.include:
++			agg_list.append(set())
++
++		agg_history_list = []
++		for i in self.include:
++			agg_history_list.append(set())
++
++		# list of keys to deallocate in diff_key_time
++		diff_key_del = []
++		for key, value in v.diff_key_time.items():
++			# if timestamp is inside aggregation period then store in diff_key_in_agg
++			if epoch - value[0] <= self.agg_sec:
++				diff_key_in_agg.append(value[1])
++				for i, j in enumerate(v.include_dict[key]):
++					agg_list[i].add(j)
++
++			# if timestamp is inside aggregation period before now - delta_time then store in diff_key_in_agg_history
++			if (epoch - value[0] <= self.delta_sec + self.agg_sec) and (epoch - value[0] >= self.delta_sec):
++				diff_key_in_agg_history.append(value[1])
++				for i, j in enumerate(v.include_dict[key]):
++					agg_history_list[i].add(j)
++
++			# if timestamp is before now - delta_time - aggregation period
++			if epoch - value[0] > self.delta_sec + self.agg_sec:
++				# add to list for later deallocation
++				diff_key_del.append(key)
++
++		for key in diff_key_del:
++			# deallocate
++			del v.diff_key_time[key]
++			del v.include_dict[key]
++
++		avg_now = 0
++		avg_history = 0
++		diff_pct = 0
++
++		if len(diff_key_in_agg) > 0:
++			avg_now = sum(diff_key_in_agg) / len(diff_key_in_agg)
++		if len(diff_key_in_agg_history) > 0:
++			avg_history = sum(diff_key_in_agg_history) / len(diff_key_in_agg_history)
++
++		if avg_history == avg_now:
++			diff_pct = 0
++		elif avg_now == 0:
++			diff_pct = 100 * avg_history
++		elif avg_history == 0:
++			diff_pct = 100 * avg_now
++		elif avg_now < avg_history:
++			diff_pct = 100 * (avg_now / avg_history)
++		elif avg_now > avg_history:
++			diff_pct = 100 * (avg_history / avg_now)
++
++
++		is_match = False
++		if abs(diff_pct) > self.threshold_pct:
++			is_match = True
++
++		if is_match == True:
++			match_dict = {
++				'diff_pct': diff_pct,
++				'diff_value': avg_now - avg_history,
++				'threshold_pct': self.threshold_pct,
++				'agg_period': None,
++				'agg_history_period': None,
++				}
++			d = {}
++			for i, j in enumerate(self.include):
++				d[j] = ",".join(agg_list[i])
++			match_dict['agg_period'] = d
++
++			d = {}
++			for i, j in enumerate(self.include):
++				d[j] = ",".join(agg_history_list[i])
++			match_dict['agg_history_period'] = d
++
++			self.add_match(match_dict)
++
++
++    def add_data(self, data):
++
++	for d in data:
++		try:
++			if d[self.qkey] not in self.qobj:
++				self.qobj[d[self.qkey]] = self.Qkey(self)
++
++			self.qobj[d[self.qkey]].set_entry(d)
++
++		except KeyError:
++			pass
++
++    class Qkey:
++	def __init__(self, outer_self):
++		self.oself = outer_self
++		# dict with doc id as key and list(timestamp, value of diff_key) as value
++		self.diff_key_time = {}
++		# docs with id as key and list of values from self.include keys as value
++		self.include_dict = {}
++
++	def set_entry(self, doc):
++		try:
++			epoch = self.oself.get_epoch(doc['@timestamp'])
++			self.diff_key_time[doc['_id']] = [epoch, doc[self.oself.diff_key]]
++			self.include_dict[doc['_id']] = []
++			for i in self.oself.include:
++				self.include_dict[doc['_id']].append(doc[i])
++		except KeyError:
++			raise KeyError
++
+ 
+ class FrequencyRule(RuleType):
+     """ A rule that matches if num_events number of events occur within a timeframe """
++++ elastalert/schema.yaml	2019-06-19 12:46:40.798067170 +0200
+@@ -66,6 +66,16 @@
+       ignore_null: {type: boolean}
+       timeframe: *timeframe
+ 
++
++  - title: Difference
++    required: [compare_key, query_key, threshold_pct, delta_min, agg_min]
++    properties:
++      type: {enum: [difference]}
++      compare_key: {type: string}
++      threshold_pct: {type: integer}
++      delta_min: {type: integer}
++      agg_min: {type: integer}
++
+   - title: Frequency
+     required: [num_events, timeframe]
+     properties:

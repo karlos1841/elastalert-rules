@@ -1,0 +1,80 @@
++++ elastalert.py	2019-06-26 10:49:59.974037246 +0200
+@@ -10,6 +10,7 @@
+ import time
+ import timeit
+ import traceback
++import subprocess
+ from email.mime.text import MIMEText
+ from smtplib import SMTP
+ from smtplib import SMTPException
+@@ -102,6 +103,7 @@
+         self.args = parser.parse_args(args)
+ 
+     def __init__(self, args):
++	self.recovery_obj = {}
+         self.parse_args(args)
+         self.debug = self.args.debug
+         self.verbose = self.args.verbose
+@@ -809,6 +811,39 @@
+             filters.append({'query': query_str_filter})
+         logging.debug("Enhanced filter with {} terms: {}".format(listname, str(query_str_filter)))
+ 
++    class Recovery:
++
++	def __init__(self):
++		self.is_match = False
++		self.is_not_match = False
++
++	def run_cmd(self, CMD):
++		proc = subprocess.Popen(CMD, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
++		stdout, stderr = proc.communicate()
++		if proc.returncode != 0:
++			output = [proc.returncode, stderr]
++			return output
++		output = [0, stdout]
++		return output
++
++	def custom_recovery(self, rule, doc):
++		try:
++			if rule['recovery'] == True:
++				print str(doc)
++				if doc['matches'] == 1:
++					self.is_match = True
++					self.is_not_match = False
++				elif doc['matches'] == 0:
++					self.is_not_match = True
++
++			if self.is_match and self.is_not_match:
++				self.is_match = False
++				self.is_not_match = False
++				print self.run_cmd(rule['recovery_command'])[1]
++
++		except KeyError:
++			pass
++
+     def run_rule(self, rule, endtime, starttime=None):
+         """ Run a rule for a given time period, including querying and alerting on results.
+ 
+@@ -869,6 +904,22 @@
+             if not self.run_query(rule, rule['starttime'], endtime):
+                 return 0
+             self.cumulative_hits += self.num_hits
++
++	    # get_hits retrieve only what's available in rule
++	    rule['include'].append('matches')
++	    rule['include'].append('rule_name')
++	    elastalert_logger.info('Recovery: start_time %s, end_time %s' % (str(endtime - datetime.timedelta(minutes=1)), str(endtime)))
++	    alert_status_docs = self.get_hits(rule, endtime - datetime.timedelta(minutes=1), endtime, 'alert_status')
++	    for doc in alert_status_docs:
++		try:
++			if doc['rule_name'] not in self.recovery_obj:
++				self.recovery_obj[doc['rule_name']] = self.Recovery()
++
++			self.recovery_obj[doc['rule_name']].custom_recovery(rule, doc)
++
++		except KeyError:
++			pass
++	    #super(eval("ruletypes." + rule['type'].__class__.__name__), rule['type']).new_garbage_collect(self.get_hits(rule, rule['starttime'], endtime, 'alert_status'))
+             rule['type'].garbage_collect(endtime)
+ 
+         # Process any new matches
